@@ -29,6 +29,10 @@
 #include <linux/regulator/machine.h>
 #include <linux/reboot.h>
 #include <linux/qpnp/qpnp-adc.h>
+#include <linux/moduleparam.h>
+
+static bool use_wlock = true;
+module_param(use_wlock, bool, 0644);
 
 #define SMB135X_BITS_PER_REG	8
 
@@ -444,7 +448,7 @@ static int smb135x_setup_vbat_monitoring(struct smb135x_chg *chip);
 
 static void smb_stay_awake(struct smb_wakeup_source *source)
 {
-	if (__test_and_clear_bit(0, &source->disabled)) {
+	if (use_wlock && __test_and_clear_bit(0, &source->disabled)) {
 		__pm_stay_awake(&source->source);
 		pr_debug("enabled source %s\n", source->source.name);
 	}
@@ -783,7 +787,6 @@ static enum power_supply_property smb135x_battery_properties[] = {
 	POWER_SUPPLY_PROP_TEMP_HOTSPOT,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_CURRENT_AVG,
-	POWER_SUPPLY_PROP_TAPER_REACHED,
 	/* Notification from Fuel Gauge */
 	POWER_SUPPLY_PROP_CAPACITY_LEVEL,
 };
@@ -1082,31 +1085,6 @@ static int smb135x_get_prop_batt_voltage_now(struct smb135x_chg *chip,
 	}
 	*volt_mv = DEFAULT_BATT_VOLT_MV;
 	return -EINVAL;
-}
-
-static bool smb135x_get_prop_taper_reached(struct smb135x_chg *chip)
-{
-	int rc = 0;
-	union power_supply_propval ret = {0, };
-
-	if (!chip->bms_psy && chip->bms_psy_name)
-		chip->bms_psy =
-			power_supply_get_by_name((char *)chip->bms_psy_name);
-
-	if (chip->bms_psy) {
-		rc = chip->bms_psy->get_property(chip->bms_psy,
-					 POWER_SUPPLY_PROP_TAPER_REACHED, &ret);
-		if (rc < 0) {
-			dev_err(chip->dev,
-				"couldn't read Taper Reached property, rc=%d\n",
-				rc);
-			return false;
-		}
-
-		if (ret.intval)
-			return true;
-	}
-	return false;
 }
 
 static int smb135x_enable_volatile_writes(struct smb135x_chg *chip)
@@ -1486,6 +1464,10 @@ static int smb135x_set_high_usb_chg_current(struct smb135x_chg *chip,
 	return rc;
 }
 
+#ifdef CONFIG_FORCE_FAST_CHARGE
+extern int force_fast_charge;
+#endif
+
 #define MAX_VERSION			0xF
 #define USB_100_PROBLEM_VERSION		0x2
 /* if APSD results are used
@@ -1535,7 +1517,17 @@ static int smb135x_set_usb_chg_current(struct smb135x_chg *chip,
 		goto out;
 	}
 	if (current_ma == CURRENT_500_MA) {
+#ifdef CONFIG_FORCE_FAST_CHARGE
+		if (force_fast_charge) {
+			current_ma = CURRENT_900_MA;
+			rc = smb135x_masked_write(chip, CFG_5_REG,
+				USB_2_3_BIT, USB_2_3_BIT);
+		} else
+			rc = smb135x_masked_write(chip, CFG_5_REG,
+				USB_2_3_BIT, 0);
+#else
 		rc = smb135x_masked_write(chip, CFG_5_REG, USB_2_3_BIT, 0);
+#endif
 		rc |= smb135x_masked_write(chip, CMD_INPUT_LIMIT,
 				USB_100_500_AC_MASK, USB_500_VAL);
 		rc |= smb135x_path_suspend(chip, USB, CURRENT, false);
@@ -2055,7 +2047,6 @@ static int smb135x_battery_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_TEMP_HOTSPOT:
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 	case POWER_SUPPLY_PROP_CURRENT_AVG:
-	case POWER_SUPPLY_PROP_TAPER_REACHED:
 		rc = smb135x_bms_get_property(chip, prop, &stat_val);
 		val->intval = stat_val;
 		if (rc < 0)
@@ -2167,7 +2158,14 @@ static void smb135x_external_power_changed(struct power_supply *psy)
 
 	if (chip->usb_psy_ma != current_limit) {
 		mutex_lock(&chip->current_change_lock);
+#ifdef CONFIG_FORCE_FAST_CHARGE
+		if (force_fast_charge)
+			chip->usb_psy_ma = 1600;
+		else
+			chip->usb_psy_ma = current_limit;
+#else
 		chip->usb_psy_ma = current_limit;
+#endif
 		rc = smb135x_set_appropriate_current(chip, USB);
 		mutex_unlock(&chip->current_change_lock);
 		if (rc < 0)
@@ -2723,7 +2721,6 @@ static void heartbeat_work(struct work_struct *work)
 	bool dc_present;
 	int batt_health;
 	int batt_soc;
-	bool taper_reached;
 	struct smb135x_chg *chip =
 		container_of(work, struct smb135x_chg,
 				heartbeat_work.work);
@@ -2758,7 +2755,6 @@ static void heartbeat_work(struct work_struct *work)
 
 	usb_present = is_usb_plugged_in(chip);
 	dc_present = is_dc_plugged_in(chip);
-	taper_reached = smb135x_get_prop_taper_reached(chip);
 
 	if (chip->usb_present && !usb_present) {
 		dev_warn(chip->dev, "HB Caught Removal!\n");
@@ -2800,7 +2796,7 @@ static void heartbeat_work(struct work_struct *work)
 		if (!chip->chg_done_batt_full &&
 		    !chip->float_charge_start_time &&
 		    chip->iterm_disabled &&
-		    taper_reached) {
+		    (batt_soc >= 100)) {
 			chip->float_charge_start_time = float_timestamp;
 			dev_warn(chip->dev, "Float Start!\n");
 		} else if (chip->float_charge_start_time &&
